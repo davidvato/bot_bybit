@@ -97,7 +97,7 @@ class BotConfig:
     # SISTEMA DE CONSENSO
     # -------------------------------------------------------------------------
     # Número mínimo de estrategias que deben coincidir para abrir una posición
-    min_consensus: int = 3
+    min_consensus: int = 2
 
     # -------------------------------------------------------------------------
     # CONFIGURACIÓN DE DATOS
@@ -136,8 +136,8 @@ class BotConfig:
             )
         if not 1 <= self.leverage <= 100:
             errors.append(f"LEVERAGE ({self.leverage}) debe estar entre 1 y 100")
-        if self.min_consensus < 1 or self.min_consensus > 4:
-            errors.append("min_consensus debe estar entre 1 y 4")
+        if self.min_consensus < 1 or self.min_consensus > 3:
+            errors.append("min_consensus debe estar entre 1 y 3")
 
         if errors:
             raise ValueError(

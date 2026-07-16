@@ -528,12 +528,11 @@ class StrategyEngine:
           - ATR y precio actual para la gestión de riesgo posterior
         """
         self.logger.info("=" * 62)
-        self.logger.info("  🧠 EVALUANDO SISTEMA DE CONSENSO — 4 ESTRATEGIAS")
+        self.logger.info("  🧠 EVALUANDO SISTEMA DE CONSENSO — 3 ESTRATEGIAS")
         self.logger.info("=" * 62)
 
-        # Ejecutar las 4 estrategias de forma independiente
+        # Ejecutar las 3 estrategias de forma independiente
         signals = [
-            self.strategy_ema_cross(df),            # Estrategia 1
             self.strategy_trend_stochrsi(df),        # Estrategia 2
             self.strategy_bollinger_reversal(df),     # Estrategia 3
             self.strategy_macd_volume(df),            # Estrategia 4
@@ -580,7 +579,7 @@ class StrategyEngine:
         else:
             self.logger.info(
                 f"\n  ⏸️  SIN CONSENSO — HOLD. "
-                f"Mínimo requerido: {min_votes}/4"
+                f"Mínimo requerido: {min_votes}/3"
             )
 
         self.logger.info("=" * 62)
