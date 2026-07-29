@@ -33,11 +33,75 @@ class RiskManager:
         self.logger   = setup_logger(__name__, config.log_file, config.get_log_level())
         self._instrument_info: Optional[dict] = None
 
+        # --- Rastreador de drawdown diario (R1) ---
+        # Resetea cada día calendario (UTC). Registra el PnL de cada trade cerrado.
+        from datetime import date
+        self._daily_loss_date: date = date.today()
+        self._daily_loss_usdt: float = 0.0  # acumula solo las pérdidas (valor positivo)
+
     def _get_instrument_info(self) -> Optional[dict]:
         """Obtiene y cachea la información del instrumento (precisión, mín qty, etc.)."""
         if self._instrument_info is None:
             self._instrument_info = self.exchange.get_instrument_info()
         return self._instrument_info
+
+    def _check_daily_drawdown(self, potential_risk_usdt: float) -> bool:
+        """
+        Verifica si la pérdida acumulada del día supera el límite configurado.
+        Resetea el contador al inicio de cada día calendario (UTC).
+
+        Args:
+            potential_risk_usdt: Pérdida máxima de la operación que se intenta abrir.
+
+        Returns:
+            bool: True si se puede operar, False si el límite diario fue alcanzado.
+        """
+        from datetime import date
+
+        # Reset diario
+        today = date.today()
+        if today != self._daily_loss_date:
+            self.logger.info(
+                f"🗓️  Nuevo día: reseteando drawdown diario. "
+                f"Pérdida del día anterior: -{self._daily_loss_usdt:.2f} USDT"
+            )
+            self._daily_loss_date = today
+            self._daily_loss_usdt = 0.0
+
+        # Sin límite configurado (0.0)
+        if self.config.max_daily_loss <= 0:
+            return True
+
+        projected_loss = self._daily_loss_usdt + potential_risk_usdt
+        if projected_loss > self.config.max_daily_loss:
+            self.logger.warning(
+                f"⛔ DRAWDOWN DIARIO ALCANZADO: Pérdida acumulada={self._daily_loss_usdt:.2f} USDT | "
+                f"Riesgo operación={potential_risk_usdt:.2f} USDT | "
+                f"Límite={self.config.max_daily_loss:.2f} USDT. "
+                f"No se abrirán nuevas posiciones hoy."
+            )
+            return False
+
+        self.logger.info(
+            f"📊 Drawdown diario: {self._daily_loss_usdt:.2f}/{self.config.max_daily_loss:.2f} USDT "
+            f"(+{potential_risk_usdt:.2f} potencial). Dentro del límite."
+        )
+        return True
+
+    def register_trade_loss(self, loss_usdt: float) -> None:
+        """
+        Registra una pérdida realizada en el rastreador diario.
+        Llamar después de confirmar que un SL fue tocado.
+
+        Args:
+            loss_usdt: Monto de la pérdida en USDT (valor positivo).
+        """
+        if loss_usdt > 0:
+            self._daily_loss_usdt += loss_usdt
+            self.logger.info(
+                f"📉 Pérdida registrada: -{loss_usdt:.2f} USDT | "
+                f"Total diario: -{self._daily_loss_usdt:.2f} USDT"
+            )
 
     def _round_qty(self, qty: float, qty_step: float) -> float:
         """
@@ -189,9 +253,11 @@ class RiskManager:
 
         Lógica de ejecución:
           1. Verificar si ya hay posición abierta
-          2. Si hay posición con señal CONTRARIA → cerrar y abrir nueva (opcional)
+          2. Si hay posición con señal CONTRARIA → cerrar y abrir nueva
           3. Si hay posición con misma dirección → ignorar (anti-duplicado)
-          4. Si no hay posición → calcular SL/TP y abrir nueva posición
+          4. Verificar límite de drawdown diario (R1)
+          5. Verificar confidence score mínimo del consenso (R4)
+          6. Si no hay posición → calcular SL/TP y abrir nueva posición
 
         Args:
             consensus: Resultado del sistema de consenso con señal validada.
@@ -205,6 +271,24 @@ class RiskManager:
         if signal == "HOLD":
             self.logger.info("⏸️  Señal HOLD. Sin acción.")
             return False
+
+        # --- R4: Verificar confidence score del consenso ---
+        # Calcular confianza promedio de las estrategias que votaron en la dirección de la señal
+        direction_signals = [
+            s for s in consensus.signals
+            if s.signal == signal
+        ]
+        if direction_signals:
+            avg_confidence = sum(s.confidence for s in direction_signals) / len(direction_signals)
+            self.logger.info(
+                f"📊 Confidence promedio de señales {signal}: {avg_confidence:.2f}"
+            )
+            if avg_confidence < 0.3:
+                self.logger.warning(
+                    f"⚠️  Confidence muy baja ({avg_confidence:.2f} < 0.30). "
+                    f"Señal {signal} ignorada para evitar entrada de baja calidad."
+                )
+                return False
 
         # --- Paso 1: Verificar posición existente (ANTI-DUPLICADO) ---
         open_position = self.exchange.get_open_position()
@@ -242,7 +326,7 @@ class RiskManager:
             self.logger.error("❌ Balance no disponible o es 0. No se puede operar.")
             return False
 
-        # --- Paso 3: Determinar lado de la orden ---
+        # --- Paso 3: Determinar lado de la orden y obtener info del instrumento ---
         side = "Buy" if signal == "LONG" else "Sell"
         entry_price = consensus.current_price
         atr = consensus.atr
@@ -252,6 +336,10 @@ class RiskManager:
                 f"❌ ATR inválido ({atr}). No se puede calcular SL/TP dinámico."
             )
             return False
+
+        # Obtener tick_size para redondeo correcto de precios en la orden
+        info = self._get_instrument_info()
+        tick_size = info["tick_size"] if info else 0.5
 
         # --- Paso 4: Calcular SL y TP dinámicos con ATR ---
         sl_price, tp_price = self.calculate_sl_tp(entry_price, atr, side)
@@ -270,6 +358,10 @@ class RiskManager:
             self.logger.error("❌ Cantidad calculada es 0. No se puede enviar la orden.")
             return False
 
+        # --- R1: Verificar límite de drawdown diario ANTES de abrir la orden ---
+        if not self._check_daily_drawdown(risk_usdt):
+            return False
+
         # --- Paso 6: Ejecutar la orden en el exchange ---
         self.logger.info(
             f"🚀 EJECUTANDO ORDEN {signal}: "
@@ -283,6 +375,7 @@ class RiskManager:
             qty=qty,
             stop_loss=sl_price,
             take_profit=tp_price,
+            tick_size=tick_size,
         )
 
         if result:

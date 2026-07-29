@@ -52,10 +52,15 @@ class BotConfig:
         default_factory=lambda: int(os.getenv("LEVERAGE", "5"))
     )
     atr_sl_multiplier: float = field(
-        default_factory=lambda: float(os.getenv("ATR_SL_MULTIPLIER", "1.5"))
+        default_factory=lambda: float(os.getenv("ATR_SL_MULTIPLIER", "2.0"))
     )
     risk_reward_ratio: float = field(
         default_factory=lambda: float(os.getenv("RISK_REWARD_RATIO", "2.0"))
+    )
+    # Pérdida máxima diaria en USDT. Si se alcanza, el bot deja de operar ese día.
+    # 0.0 = sin límite (no recomendado para producción)
+    max_daily_loss: float = field(
+        default_factory=lambda: float(os.getenv("MAX_DAILY_LOSS", "0.0"))
     )
 
     # -------------------------------------------------------------------------
@@ -96,8 +101,21 @@ class BotConfig:
     # -------------------------------------------------------------------------
     # SISTEMA DE CONSENSO
     # -------------------------------------------------------------------------
-    # Número mínimo de estrategias que deben coincidir para abrir una posición
+    # Número mínimo de estrategias (de 4) que deben coincidir para abrir posición.
+    # Con 4 estrategias activas, se recomienda 3 para produccion.
+    # Para TESTING: usar 2 para generar mas senales y validar la mecanica del bot.
+    # Para PRODUCCION: volver a 3.
     min_consensus: int = 2
+
+    # -------------------------------------------------------------------------
+    # FILTRO ADX
+    # -------------------------------------------------------------------------
+    # ADX mínimo para operar. Por debajo de este valor el mercado es lateral
+    # y las estrategias de momentum generan falsas señales.
+    adx_period: int = 14
+    adx_min_threshold: float = field(
+        default_factory=lambda: float(os.getenv("ADX_MIN_THRESHOLD", "20.0"))
+    )
 
     # -------------------------------------------------------------------------
     # CONFIGURACIÓN DE DATOS
@@ -136,8 +154,12 @@ class BotConfig:
             )
         if not 1 <= self.leverage <= 100:
             errors.append(f"LEVERAGE ({self.leverage}) debe estar entre 1 y 100")
-        if self.min_consensus < 1 or self.min_consensus > 3:
-            errors.append("min_consensus debe estar entre 1 y 3")
+        if self.min_consensus < 1 or self.min_consensus > 4:
+            errors.append("min_consensus debe estar entre 1 y 4 (hay 4 estrategias activas)")
+        if self.max_daily_loss < 0:
+            errors.append("MAX_DAILY_LOSS no puede ser negativo")
+        if self.adx_min_threshold < 0 or self.adx_min_threshold > 100:
+            errors.append("ADX_MIN_THRESHOLD debe estar entre 0 y 100")
 
         if errors:
             raise ValueError(

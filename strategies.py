@@ -5,14 +5,22 @@ strategies.py - Motor de Cálculo de Indicadores y Sistema de Consenso
 Usa la librería 'ta' (compatible con Python 3.14+) en lugar de pandas-ta.
 
 ESTRATEGIAS IMPLEMENTADAS:
-  1. EMA Cross Adaptativo (EMA 9 vs EMA 21)
-  2. Filtro de Tendencia EMA 200 + StochRSI (14,3,3)
-  3. Ruptura de Bandas de Bollinger (BB 20,2) + RSI estándar
-  4. Confirmación de Momento y Volumen (MACD 12,26,9 + Vol SMA 20)
+  1. EMA Cross Adaptativo (EMA 9 vs EMA 21)          — Momentum de corto plazo
+  2. Filtro de Tendencia EMA 200 + StochRSI (14,3,3) — Trend-following macro
+  3. Ruptura de Bandas de Bollinger (BB 20,2) + RSI  — Reversión a la media
+  4. Confirmación de Momento y Volumen (MACD + Vol)  — Confirmación de impulso
+
+NOTA SOBRE EL DISEÑO DEL CONSENSO:
+  Las estrategias 2 (trend) y 3 (reversión) son antagónicas por naturaleza.
+  Esto es INTENCIONAL: la Estrategia 3 actúa como filtro de sobreextensión.
+  Si el mercado está en tendencia fuerte con precio sobre BB superior (S3=SHORT)
+  pero EMA200+StochRSI dicen LONG, la señal contradictoria de S3 fuerza un
+  consenso más exigente (3/4), evitando entradas en zonas de sobrecompra.
+  El resultado es un sistema que combina momentum con gestión de sobreextensión.
 
 SISTEMA DE CONSENSO:
-  - LONG:  ≥3 estrategias generan señal de compra
-  - SHORT: ≥3 estrategias generan señal de venta
+  - LONG:  ≥3 de 4 estrategias generan señal de compra
+  - SHORT: ≥3 de 4 estrategias generan señal de venta
   - HOLD:  <3 estrategias coinciden → no operar
 =============================================================================
 """
@@ -26,7 +34,7 @@ import pandas as pd
 
 # Librería 'ta': compatible con Python 3.14+, sin dependencia de numba
 import ta
-from ta.trend import EMAIndicator, MACD, SMAIndicator
+from ta.trend import EMAIndicator, MACD, SMAIndicator, ADXIndicator
 from ta.momentum import RSIIndicator, StochRSIIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 
@@ -187,6 +195,22 @@ class IndicatorEngine:
                 window=self.config.atr_period,
                 fillna=False,
             ).average_true_range()
+
+            # -----------------------------------------------------------------
+            # ADX (N1) — Filtro de régimen de mercado
+            # ADX > adx_min_threshold = mercado en tendencia (apto para operar)
+            # ADX < adx_min_threshold = mercado lateral (evitar señales falsas)
+            # -----------------------------------------------------------------
+            adx_indicator = ADXIndicator(
+                high=high,
+                low=low,
+                close=close,
+                window=self.config.adx_period,
+                fillna=False,
+            )
+            df["adx"]     = adx_indicator.adx()
+            df["adx_pos"] = adx_indicator.adx_pos()  # DI+ (dirección alcista)
+            df["adx_neg"] = adx_indicator.adx_neg()  # DI- (dirección bajista)
 
             self.logger.debug("✅ Todos los indicadores calculados correctamente.")
             return df
@@ -528,14 +552,53 @@ class StrategyEngine:
           - ATR y precio actual para la gestión de riesgo posterior
         """
         self.logger.info("=" * 62)
-        self.logger.info("  🧠 EVALUANDO SISTEMA DE CONSENSO — 3 ESTRATEGIAS")
+        self.logger.info("  🧠 EVALUANDO SISTEMA DE CONSENSO — 4 ESTRATEGIAS")
         self.logger.info("=" * 62)
 
-        # Ejecutar las 3 estrategias de forma independiente
+        # --- N1: FILTRO ADX — Régimen de mercado ---
+        # Si ADX < umbral mínimo, el mercado está en rango lateral.
+        # Las estrategias de momentum generan falsas señales en rangos.
+        # Forzamos HOLD para evitar entradas de baja probabilidad.
+        current_price = float(df["close"].iloc[-1])
+        atr_val = df["atr"].iloc[-1]
+        atr = float(atr_val) if not pd.isna(atr_val) else 0.0
+
+        adx_val = df["adx"].iloc[-1] if "adx" in df.columns else float("nan")
+        if not pd.isna(adx_val):
+            adx_pos = float(df["adx_pos"].iloc[-1]) if not pd.isna(df["adx_pos"].iloc[-1]) else 0.0
+            adx_neg = float(df["adx_neg"].iloc[-1]) if not pd.isna(df["adx_neg"].iloc[-1]) else 0.0
+            adx_direction = "alcista ↑" if adx_pos > adx_neg else "bajista ↓"
+            self.logger.info(
+                f"  📶 ADX={adx_val:.1f} (DI+={adx_pos:.1f} / DI-={adx_neg:.1f}) "
+                f"| Dirección: {adx_direction} "
+                f"| Umbral mínimo: {self.config.adx_min_threshold:.0f}"
+            )
+            if adx_val < self.config.adx_min_threshold:
+                self.logger.info(
+                    f"  🟡 MERCADO LATERAL DETECTADO — ADX={adx_val:.1f} < {self.config.adx_min_threshold:.0f}. "
+                    f"Forzando HOLD para evitar señales de baja calidad."
+                )
+                self.logger.info("=" * 62)
+                return ConsensusResult(
+                    final_signal="HOLD",
+                    long_count=0, short_count=0, hold_count=4,
+                    signals=[],
+                    atr=atr,
+                    current_price=current_price,
+                )
+        else:
+            self.logger.warning("  ⚠️  ADX no disponible (NaN). Continuando sin filtro de régimen.")
+
+        # Ejecutar las 4 estrategias de forma independiente.
+        # NOTA: S1 (EMA Cross) y S2 (EMA200+StochRSI) siguen tendencia;
+        #       S3 (Bollinger) actúa como filtro de sobreextensión (reversión);
+        #       S4 (MACD+Vol) confirma el impulso con volumen real.
+        # El consenso exige 3/4 votos para filtrar señales de baja calidad.
         signals = [
-            self.strategy_trend_stochrsi(df),        # Estrategia 2
-            self.strategy_bollinger_reversal(df),     # Estrategia 3
-            self.strategy_macd_volume(df),            # Estrategia 4
+            self.strategy_ema_cross(df),              # Estrategia 1 — EMA 9/21 momentum
+            self.strategy_trend_stochrsi(df),         # Estrategia 2 — EMA200 + StochRSI
+            self.strategy_bollinger_reversal(df),     # Estrategia 3 — BB Reversal (filtro)
+            self.strategy_macd_volume(df),            # Estrategia 4 — MACD + Volumen
         ]
 
         # Contabilizar votos
@@ -552,13 +615,9 @@ class StrategyEngine:
 
         self.logger.info(
             f"\n  📊 RESULTADO → 🟢 LONG: {long_count}  "
-            f"🔴 SHORT: {short_count}  ⚪ HOLD: {hold_count}"
+            f"🔴 SHORT: {short_count}  ⚪ HOLD: {hold_count}  "
+            f"(mínimo requerido: {self.config.min_consensus}/4)"
         )
-
-        # Obtener precio actual y ATR para gestión de riesgo
-        current_price = float(df["close"].iloc[-1])
-        atr_val       = df["atr"].iloc[-1]
-        atr           = float(atr_val) if not pd.isna(atr_val) else 0.0
 
         # --- Determinar señal final por consenso ---
         final_signal: SignalType = "HOLD"
@@ -579,7 +638,7 @@ class StrategyEngine:
         else:
             self.logger.info(
                 f"\n  ⏸️  SIN CONSENSO — HOLD. "
-                f"Mínimo requerido: {min_votes}/3"
+                f"Mínimo requerido: {min_votes}/4"
             )
 
         self.logger.info("=" * 62)

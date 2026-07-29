@@ -33,6 +33,7 @@ from exchange import ExchangeClient
 from logger import setup_logger
 from risk_manager import RiskManager
 from strategies import ConsensusResult, IndicatorEngine, StrategyEngine
+from trade_journal import TradeJournal
 
 
 class TradingBot:
@@ -50,10 +51,11 @@ class TradingBot:
 
         # Inicializar módulos
         self.logger.info("🔧 Inicializando módulos del bot...")
-        self.exchange       = ExchangeClient(cfg)
+        self.exchange         = ExchangeClient(cfg)
         self.indicator_engine = IndicatorEngine(cfg)
         self.strategy_engine  = StrategyEngine(cfg)
-        self.risk_manager   = RiskManager(cfg, self.exchange)
+        self.risk_manager     = RiskManager(cfg, self.exchange)
+        self.trade_journal    = TradeJournal(cfg)
 
         # Configurar captura de señales del sistema (Ctrl+C, kill)
         signal.signal(signal.SIGINT,  self._graceful_shutdown)
@@ -165,6 +167,32 @@ class TradingBot:
             executed = self.risk_manager.execute_signal(consensus)
             if executed:
                 self._orders_placed += 1
+                # N2: Registrar la operación en el Trade Journal
+                # Recalculamos SL/TP tal como lo hizo el risk_manager para el log
+                side = "Buy" if consensus.final_signal == "LONG" else "Sell"
+                info = self.risk_manager._get_instrument_info()
+                tick_size = info["tick_size"] if info else 0.5
+                sl_price, tp_price = self.risk_manager.calculate_sl_tp(
+                    consensus.current_price, consensus.atr, side
+                )
+                balance = self.exchange.get_wallet_balance() or 0.0
+                _, risk_usdt = self.risk_manager.calculate_position_size(
+                    balance, consensus.current_price, sl_price
+                )
+                # Obtener qty del último cálculo (aproximado — el tamaño real lo confirmó el exchange)
+                qty_raw = (risk_usdt * self.config.leverage) / max(
+                    abs(consensus.current_price - sl_price), 0.0001
+                )
+                from risk_manager import RiskManager
+                qty = self.risk_manager._round_qty(qty_raw, info["qty_step"] if info else 0.001)
+                self.trade_journal.log_trade(
+                    consensus=consensus,
+                    side=side,
+                    qty=qty,
+                    stop_loss=sl_price,
+                    take_profit=tp_price,
+                    risk_usdt=risk_usdt,
+                )
         else:
             self.logger.info("⏸️  Sin señal de consenso. Esperando próxima vela.")
 
@@ -319,6 +347,8 @@ class TradingBot:
         self.logger.info(f"  Órdenes enviadas: {self._orders_placed}")
         self.logger.info("=" * 60)
         self.logger.info("🔴 Bot detenido.")
+        # N3: Mostrar métricas detalladas del trade journal
+        self.trade_journal.print_session_metrics()
 
 
 # =============================================================================

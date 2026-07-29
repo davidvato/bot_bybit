@@ -284,10 +284,16 @@ class ExchangeClient:
             coins = response["result"]["list"][0]["coin"]
             for coin_data in coins:
                 if coin_data["coin"] == "USDT":
-                    # En UTA, availableToWithdraw puede venir vacio (""), por eso usamos walletBalance
-                    wallet_bal = coin_data.get("walletBalance", "0")
-                    balance = float(wallet_bal) if wallet_bal else 0.0
-                    self.logger.debug(f"Balance disponible: {balance:.2f} USDT")
+                    # F3 FIX: Usar availableToWithdraw para reflejar el capital real
+                    # disponible, excluyendo márgenes comprometidos y PnL no realizado.
+                    # Fallback a walletBalance solo si availableToWithdraw viene vacío.
+                    avail = coin_data.get("availableToWithdraw", "")
+                    if avail and float(avail) > 0:
+                        balance = float(avail)
+                    else:
+                        wallet_bal = coin_data.get("walletBalance", "0")
+                        balance = float(wallet_bal) if wallet_bal else 0.0
+                    self.logger.debug(f"Balance disponible (availableToWithdraw): {balance:.2f} USDT")
                     return balance
             return 0.0
         except (KeyError, IndexError, ValueError) as e:
@@ -397,6 +403,7 @@ class ExchangeClient:
         stop_loss: float,
         take_profit: float,
         reduce_only: bool = False,
+        tick_size: float = 0.5,
     ) -> Optional[dict]:
         """
         Ejecuta una orden de mercado con SL y TP integrados.
@@ -407,14 +414,23 @@ class ExchangeClient:
             stop_loss: Precio del Stop Loss.
             take_profit: Precio del Take Profit.
             reduce_only: True para órdenes de cierre de posición.
-
-        Returns:
-            dict con info de la orden ejecutada, o None si falló.
+            tick_size: Tamaño de tick del instrumento para redondeo correcto de precios.
         """
+        # F4 FIX: Redondear SL/TP al tick_size real del instrumento
+        # en lugar de 4 decimales hardcoded, que puede ser inválido en algunos pares.
+        import math
+        def _round_tick(price: float, tick: float) -> str:
+            if tick <= 0:
+                return str(round(price, 4))
+            decimals = max(0, -int(math.floor(math.log10(tick))))
+            return str(round(round(price / tick) * tick, decimals))
+
+        sl_str = _round_tick(stop_loss, tick_size)
+        tp_str = _round_tick(take_profit, tick_size)
         order_type = "APERTURA" if not reduce_only else "CIERRE"
         self.logger.info(
             f"📤 Enviando orden {order_type}: {side} | "
-            f"Qty={qty} | SL={stop_loss:.4f} | TP={take_profit:.4f}"
+            f"Qty={qty} | SL={sl_str} | TP={tp_str}"
         )
 
         response = self._safe_request(
@@ -424,8 +440,8 @@ class ExchangeClient:
             side=side,
             orderType="Market",
             qty=str(qty),
-            stopLoss=str(round(stop_loss, 4)),
-            takeProfit=str(round(take_profit, 4)),
+            stopLoss=sl_str,
+            takeProfit=tp_str,
             reduceOnly=reduce_only,
             timeInForce="IOC",  # Immediate or Cancel para órdenes de mercado
         )
