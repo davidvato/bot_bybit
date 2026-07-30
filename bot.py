@@ -31,6 +31,7 @@ from typing import Optional
 from config import BotConfig, config
 from exchange import ExchangeClient
 from logger import setup_logger
+from notifier import TelegramNotifier
 from risk_manager import RiskManager
 from strategies import ConsensusResult, IndicatorEngine, StrategyEngine
 from trade_journal import TradeJournal
@@ -56,6 +57,7 @@ class TradingBot:
         self.strategy_engine  = StrategyEngine(cfg)
         self.risk_manager     = RiskManager(cfg, self.exchange)
         self.trade_journal    = TradeJournal(cfg)
+        self.notifier         = TelegramNotifier(cfg.telegram_token, cfg.telegram_chat_id)
 
         # Configurar captura de señales del sistema (Ctrl+C, kill)
         signal.signal(signal.SIGINT,  self._graceful_shutdown)
@@ -245,6 +247,15 @@ class TradingBot:
         else:
             self.logger.warning("⚠️  No se pudo verificar el balance inicial.")
 
+        # Notificar inicio por Telegram
+        self.notifier.notify_bot_started(
+            symbol=self.config.symbol,
+            timeframe=self.config.timeframe,
+            leverage=self.config.leverage,
+            balance=balance or 0.0,
+            testnet=self.config.testnet,
+        )
+
         return True
 
     def run(self) -> None:
@@ -308,6 +319,7 @@ class TradingBot:
                     f"❌ Error inesperado en el bucle principal:\n"
                     f"{traceback.format_exc()}"
                 )
+                self.notifier.notify_critical_error(traceback.format_exc())
                 self.logger.info("⏳ Esperando 30s antes de reintentar...")
                 time.sleep(30)
 
@@ -335,11 +347,12 @@ class TradingBot:
         duration = datetime.now(timezone.utc) - self._session_start
         hours, remainder = divmod(int(duration.total_seconds()), 3600)
         minutes, seconds = divmod(remainder, 60)
+        duration_str = f"{hours:02d}h {minutes:02d}m {seconds:02d}s"
 
         self.logger.info("\n" + "=" * 60)
         self.logger.info("  📊 RESUMEN DE SESIÓN")
         self.logger.info("=" * 60)
-        self.logger.info(f"  Duración:         {hours:02d}h {minutes:02d}m {seconds:02d}s")
+        self.logger.info(f"  Duración:         {duration_str}")
         self.logger.info(f"  Ciclos ejecutados:{self._cycles_run}")
         self.logger.info(f"  Señales LONG:     {self._signals_long}")
         self.logger.info(f"  Señales SHORT:    {self._signals_short}")
@@ -349,6 +362,12 @@ class TradingBot:
         self.logger.info("🔴 Bot detenido.")
         # N3: Mostrar métricas detalladas del trade journal
         self.trade_journal.print_session_metrics()
+        # Notificar parada por Telegram
+        self.notifier.notify_bot_stopped(
+            cycles=self._cycles_run,
+            orders=self._orders_placed,
+            duration_str=duration_str,
+        )
 
 
 # =============================================================================

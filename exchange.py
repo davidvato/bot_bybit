@@ -189,6 +189,19 @@ class ExchangeClient:
                     self.logger.debug("Apalancamiento ya estaba configurado correctamente.")
                     return {"retCode": 0, "result": {}}
 
+                # Errores determinísticos: no tiene sentido reintentar
+                # 110007 = balance insuficiente (se resuelve ajustando qty, no reintentando)
+                # 110017 = qty por debajo del mínimo
+                # 110040 = posición ya cerrada
+                # 110052 = reduce-only orden rechazada (sin posición que reducir)
+                NON_RETRYABLE = {"110007", "110017", "110040", "110052"}
+                if any(code in err_str for code in NON_RETRYABLE):
+                    self.logger.error(
+                        f"❌ Error no recuperable (ErrCode detectado): {e}. "
+                        f"Abortando reintentos."
+                    )
+                    return None
+
                 delay = self._RETRY_BASE_DELAY * attempt
                 self.logger.error(
                     f"Error inesperado (intento {attempt}/{self._MAX_RETRIES}): {e}. "

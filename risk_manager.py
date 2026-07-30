@@ -18,6 +18,7 @@ from typing import Optional, Tuple
 from config import BotConfig
 from exchange import ExchangeClient
 from logger import setup_logger
+from notifier import TelegramNotifier
 from strategies import ConsensusResult
 
 
@@ -31,6 +32,7 @@ class RiskManager:
         self.config   = config
         self.exchange = exchange
         self.logger   = setup_logger(__name__, config.log_file, config.get_log_level())
+        self.notifier = TelegramNotifier(config.telegram_token, config.telegram_chat_id)
         self._instrument_info: Optional[dict] = None
 
         # --- Rastreador de drawdown diario (R1) ---
@@ -79,6 +81,11 @@ class RiskManager:
                 f"Riesgo operación={potential_risk_usdt:.2f} USDT | "
                 f"Límite={self.config.max_daily_loss:.2f} USDT. "
                 f"No se abrirán nuevas posiciones hoy."
+            )
+            self.notifier.notify_daily_drawdown(
+                accumulated_loss=self._daily_loss_usdt,
+                limit=self.config.max_daily_loss,
+                risk_attempted=potential_risk_usdt,
             )
             return False
 
@@ -168,6 +175,24 @@ class RiskManager:
         # permiten perder exactamente risk_usdt si se activa el SL
         qty_raw = (risk_usdt * self.config.leverage) / sl_distance
 
+        # --- MARGIN CAP: Verificar que el margen requerido no supere el balance ---
+        # Margen requerido = (qty * entry_price) / leverage
+        # Si supera el balance disponible, Bybit retornará ErrCode 110007.
+        # Se limita al 95% del balance para dejar margen para comisiones y funding.
+        max_margin_usdt = balance * 0.95
+        max_qty_by_margin = (max_margin_usdt * self.config.leverage) / entry_price
+
+        if qty_raw > max_qty_by_margin:
+            self.logger.warning(
+                f"⚠️  MARGIN CAP APLICADO: Qty por riesgo ({qty_raw:.4f}) supera el "
+                f"máximo permitido por margen disponible ({max_qty_by_margin:.4f}). "
+                f"Margen requerido original: "
+                f"{(qty_raw * entry_price / self.config.leverage):.2f} USDT | "
+                f"Balance disponible: {balance:.2f} USDT. "
+                f"Se ajusta qty para no exceder el margen."
+            )
+            qty_raw = max_qty_by_margin
+
         # Redondear al step mínimo del instrumento
         qty_rounded = self._round_qty(qty_raw, info["qty_step"])
 
@@ -179,12 +204,15 @@ class RiskManager:
             )
             qty_rounded = info["min_order_qty"]
 
+        # Verificación final: confirmar que el margen requerido es viable
+        margin_required = (qty_rounded * entry_price) / self.config.leverage
         self.logger.info(
             f"📐 Tamaño de posición calculado: "
             f"Balance={balance:.2f} USDT | "
             f"Riesgo={risk_usdt:.2f} USDT ({self.config.risk_per_trade*100:.1f}%) | "
             f"SL Distance={sl_distance:.4f} | "
-            f"Qty={qty_rounded}"
+            f"Qty={qty_rounded} | "
+            f"Margen requerido={margin_required:.2f} USDT ({margin_required/balance*100:.1f}% del balance)"
         )
 
         return qty_rounded, risk_usdt
@@ -319,6 +347,13 @@ class RiskManager:
                         "Abortando nueva entrada para evitar sobreexposición."
                     )
                     return False
+                # Notificar cierre por señal contraria
+                self.notifier.notify_position_closed(
+                    reason="CONTRARIA",
+                    symbol=self.config.symbol,
+                    side=existing_side,
+                    pnl=open_position.get("unrealised_pnl"),
+                )
 
         # --- Paso 2: Obtener balance disponible ---
         balance = self.exchange.get_wallet_balance()
@@ -383,7 +418,23 @@ class RiskManager:
                 f"✅ ¡ORDEN {signal} EJECUTADA EXITOSAMENTE! "
                 f"OrderID: {result.get('orderId', 'N/A')}"
             )
+            self.notifier.notify_order_executed(
+                signal=signal,
+                symbol=self.config.symbol,
+                entry_price=entry_price,
+                qty=qty,
+                stop_loss=sl_price,
+                take_profit=tp_price,
+                risk_usdt=risk_usdt,
+                balance=balance,
+            )
             return True
         else:
             self.logger.error(f"❌ FALLÓ la ejecución de la orden {signal}.")
+            self.notifier.notify_order_failed(
+                signal=signal,
+                symbol=self.config.symbol,
+                qty=qty,
+                error_msg=f"Exchange rechazó la orden tras {self._MAX_RETRIES if hasattr(self, '_MAX_RETRIES') else 5} intentos",
+            )
             return False

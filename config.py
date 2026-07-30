@@ -34,6 +34,16 @@ class BotConfig:
     )
 
     # -------------------------------------------------------------------------
+    # TELEGRAM
+    # -------------------------------------------------------------------------
+    telegram_token: str = field(
+        default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", "")
+    )
+    telegram_chat_id: str = field(
+        default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", "")
+    )
+
+    # -------------------------------------------------------------------------
     # CONFIGURACIÓN DE MERCADO
     # -------------------------------------------------------------------------
     symbol: str = field(default_factory=lambda: os.getenv("TRADING_SYMBOL", "BTCUSDT"))
