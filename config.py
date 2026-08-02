@@ -87,8 +87,11 @@ class BotConfig:
     stoch_rsi_period: int = 14
     stoch_rsi_smooth_k: int = 3
     stoch_rsi_smooth_d: int = 3
-    stoch_rsi_oversold: float = 20.0
-    stoch_rsi_overbought: float = 80.0
+    # [Mejora #1] Umbrales relajados vs version anterior (20/80).
+    # En 15m el StochRSI rara vez baja de 20; con 30/70 se capturan
+    # mas cruces validos sin perder calidad de senal.
+    stoch_rsi_oversold: float = 30.0
+    stoch_rsi_overbought: float = 70.0
 
     # Bandas de Bollinger (Estrategia 3)
     bb_period: int = 20
@@ -104,6 +107,13 @@ class BotConfig:
 
     # Volumen SMA (Estrategia 4)
     volume_sma_period: int = 20
+    # [Mejora #2] Umbral minimo de volumen relativo para confirmar senales MACD.
+    # 1.0 = exige volumen por encima de la media (demasiado estricto en 15m).
+    # 0.7 = acepta volumen moderado (70% de la media), reduce falsos negativos.
+    # Configurable via .env como VOLUME_RATIO_THRESHOLD.
+    volume_ratio_threshold: float = field(
+        default_factory=lambda: float(os.getenv("VOLUME_RATIO_THRESHOLD", "0.7"))
+    )
 
     # ATR para Stop Loss dinámico
     atr_period: int = 14
@@ -146,9 +156,21 @@ class BotConfig:
     # -------------------------------------------------------------------------
     # CONTROL DE BUCLE PRINCIPAL
     # -------------------------------------------------------------------------
-    # Segundos antes del cierre de vela para ejecutar análisis
-    # (para que los datos estén disponibles)
+    # Segundos antes del cierre de vela para ejecutar analisis
+    # (para que los datos esten disponibles)
     seconds_before_close: int = 10
+
+    # -------------------------------------------------------------------------
+    # EXPIRACION AUTOMATICA DE TRADES [Mejora #3]
+    # -------------------------------------------------------------------------
+    # Numero maximo de velas que una posicion puede estar abierta sin alcanzar
+    # SL ni TP. Si se supera, el bot cierra la posicion a mercado para evitar
+    # acumulacion de funding rate y mantener el capital disponible.
+    # 8 velas x 15m = 2 horas maximo por trade.
+    # 0 = sin limite (desactivado).
+    max_candles_open: int = field(
+        default_factory=lambda: int(os.getenv("MAX_CANDLES_OPEN", "8"))
+    )
 
     def validate(self) -> None:
         """Valida que la configuración sea correcta antes de iniciar el bot."""

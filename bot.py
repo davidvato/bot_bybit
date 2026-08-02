@@ -71,9 +71,9 @@ class TradingBot:
         self._orders_placed  = 0
         self._session_start  = datetime.now(timezone.utc)
 
-        # Rastreador de posición activa en memoria.
+        # Rastreador de posicion activa en memoria.
         # Se rellena al ejecutar una orden y se limpia al detectar el cierre.
-        # Campos: timestamp, side, entry_price, stop_loss, take_profit, risk_usdt
+        # Campos: timestamp, side, entry_price, stop_loss, take_profit, risk_usdt, candles_open
         self._pending_trade: Optional[dict] = None
 
     # =========================================================================
@@ -141,6 +141,9 @@ class TradingBot:
           4. Registra la pérdida en el risk_manager (drawdown diario).
           5. Envía notificación de Telegram con el resultado.
           6. Limpia _pending_trade para permitir la próxima entrada.
+
+        [Mejora #3] Si la posición lleva más de max_candles_open velas sin
+        cerrar, se cierra a mercado para evitar acumulación de funding rate.
         """
         if self._pending_trade is None:
             return  # Nada que reconciliar
@@ -148,15 +151,78 @@ class TradingBot:
         open_pos = self.exchange.get_open_position()
 
         if open_pos is not None:
-            # Posición todavía activa → reportar PnL no realizado y continuar
+            # Incrementar el contador de velas abiertas [Mejora #3]
+            self._pending_trade["candles_open"] = (
+                self._pending_trade.get("candles_open", 0) + 1
+            )
+            candles_open = self._pending_trade["candles_open"]
             upnl = open_pos.get("unrealised_pnl", 0.0)
             self.logger.info(
                 f"📌 Posición {open_pos['side']} sigue ACTIVA | "
-                f"Unrealized PnL: {upnl:+.2f} USDT"
+                f"Vela #{candles_open} | Unrealized PnL: {upnl:+.2f} USDT"
             )
+
+            # --- Mejora #3: Expiración automática de trades ---
+            max_candles = self.config.max_candles_open
+            if max_candles > 0 and candles_open >= max_candles:
+                self.logger.warning(
+                    f"⏰ EXPIRACIÓN DE TRADE: La posición lleva {candles_open} velas abierta "
+                    f"(máximo: {max_candles} x {self.config.timeframe}m = "
+                    f"{max_candles * int(self.config.timeframe)} min). "
+                    f"PnL no realizado: {upnl:+.2f} USDT. Cerrando a mercado..."
+                )
+                existing_side = open_pos["side"]
+                close_result  = self.exchange.close_position(
+                    existing_side, open_pos["size"]
+                )
+                if close_result:
+                    self.logger.info("✅ Posición cerrada por expiración de tiempo.")
+                    time.sleep(1)  # Pausa para que Bybit registre el cierre
+                    closed_records = self.exchange.get_last_closed_pnl(limit=3)
+                    pnl_usdt   = 0.0
+                    exit_price = 0.0
+                    if closed_records:
+                        record     = closed_records[0]
+                        pnl_usdt   = record["closed_pnl"]
+                        exit_price = record["avg_exit_price"]
+                    else:
+                        pnl_usdt = float(upnl)
+
+                    status = "WIN" if pnl_usdt > 0 else "LOSS"
+                    ts = self._pending_trade.get("timestamp", "")
+                    risk_usdt = self._pending_trade.get("risk_usdt", 0.0)
+                    if ts:
+                        self.trade_journal.close_trade(
+                            timestamp=ts,
+                            status="EXPIRED",
+                            pnl_usdt=pnl_usdt,
+                            avg_exit_price=exit_price,
+                            candles_open=candles_open,
+                            close_reason="EXPIRACION",
+                            risk_usdt=risk_usdt,
+                        )
+                    if pnl_usdt < 0:
+                        self.risk_manager.register_trade_loss(abs(pnl_usdt))
+                    side = self._pending_trade.get("side", "?")
+                    self.logger.info(
+                        f"{'✅' if status == 'WIN' else '❌'} POSICIÓN EXPIRADA {side} | "
+                        f"PnL={pnl_usdt:+.2f} USDT | Velas={candles_open}"
+                    )
+                    self.notifier.notify_position_closed(
+                        reason="EXPIRACION",
+                        symbol=self.config.symbol,
+                        side=side,
+                        pnl=pnl_usdt,
+                    )
+                    self._pending_trade = None
+                else:
+                    self.logger.error(
+                        "❌ No se pudo cerrar la posición expirada. Se reintentará en el siguiente ciclo."
+                    )
             return
 
         # ── Posición cerrada detectada ────────────────────────────────────
+        candles_open = self._pending_trade.get("candles_open", 0)
         self.logger.info(
             "🔔 RECONCILIACIÓN: Posición cerrada detectada en Bybit "
             "(SL/TP tocado o liquidación). Consultando PnL real..."
@@ -187,14 +253,18 @@ class TradingBot:
         status = "WIN" if pnl_usdt > 0 else "LOSS"
         emoji  = "✅" if status == "WIN" else "❌"
 
-        # Actualizar el journal CSV
+        # Actualizar el journal CSV con todos los campos [Mejora #3]
         ts = self._pending_trade.get("timestamp", "")
+        risk_usdt = self._pending_trade.get("risk_usdt", 0.0)
         if ts:
             self.trade_journal.close_trade(
                 timestamp=ts,
                 status=status,
                 pnl_usdt=pnl_usdt,
                 avg_exit_price=exit_price,
+                candles_open=candles_open,
+                close_reason="SL/TP",
+                risk_usdt=risk_usdt,
             )
 
         # Registrar pérdida en el drawdown diario
@@ -205,7 +275,7 @@ class TradingBot:
         side = self._pending_trade.get("side", "?")
         self.logger.info(
             f"{emoji} POSICIÓN {side} CERRADA POR SL/TP | "
-            f"PnL={pnl_usdt:+.2f} USDT | Status={status}"
+            f"PnL={pnl_usdt:+.2f} USDT | Status={status} | Velas={candles_open}"
         )
         self.notifier.notify_position_closed(
             reason="SL/TP",
@@ -297,14 +367,15 @@ class TradingBot:
                     risk_usdt=risk_usdt,
                 )
 
-                # Registrar en el rastreador de posición activa para reconciliación
+                # Registrar en el rastreador de posicion activa para reconciliacion
                 self._pending_trade = {
-                    "timestamp":   trade_ts,
-                    "side":        side,
-                    "entry_price": consensus.current_price,
-                    "stop_loss":   sl_price,
-                    "take_profit": tp_price,
-                    "risk_usdt":   risk_usdt,
+                    "timestamp":    trade_ts,
+                    "side":         side,
+                    "entry_price":  consensus.current_price,
+                    "stop_loss":    sl_price,
+                    "take_profit":  tp_price,
+                    "risk_usdt":    risk_usdt,
+                    "candles_open": 0,  # Contador de velas [Mejora #3]
                 }
                 self.logger.info(
                     f"🔖 Posición registrada en rastreador interno: "

@@ -458,17 +458,18 @@ class StrategyEngine:
         """
         Estrategia 4: MACD (12,26,9) + Confirmación de Volumen (SMA 20).
 
-        LÓGICA:
+        LOGICA:
           LONG:  Histograma MACD pasa de negativo a positivo
-                 O línea MACD cruza al alza la línea de señal
-                 AND volumen actual > SMA_20 del volumen
+                 O linea MACD cruza al alza la linea de senal
+                 AND vol_ratio >= config.volume_ratio_threshold
 
           SHORT: Histograma MACD pasa de positivo a negativo
-                 O línea MACD cruza a la baja la línea de señal
-                 AND volumen actual > SMA_20 del volumen
+                 O linea MACD cruza a la baja la linea de senal
+                 AND vol_ratio >= config.volume_ratio_threshold
 
-        El filtro de volumen es OBLIGATORIO para confirmar que el movimiento
-        tiene participación real del mercado (evita falsos breakouts).
+        [Mejora #2] El umbral de volumen es ahora configurable via
+        config.volume_ratio_threshold (default 0.7). El umbral anterior
+        de 1.0x era demasiado estricto para 15m y bloqueaba senales validas.
         """
         name = "MACD + Volume Confirmation"
 
@@ -486,8 +487,10 @@ class StrategyEngine:
                              hist_curr, hist_prev, vol_curr, vol_sma])):
                 return SignalResult(name=name, signal="HOLD", reason="Datos insuficientes (NaN)", confidence=0)
 
-            high_volume   = vol_curr > vol_sma
+            # [Mejora #2] Umbral de volumen configurable (default 0.7 vs 1.0 anterior)
             vol_ratio     = vol_curr / vol_sma if vol_sma > 0 else 1.0
+            vol_threshold = self.config.volume_ratio_threshold
+            high_volume   = vol_ratio >= vol_threshold
 
             # Cruce alcista del MACD / histograma positivo
             macd_cross_up   = macd_prev < sig_prev and macd_curr > sig_curr
@@ -506,7 +509,7 @@ class StrategyEngine:
                     name=name, signal="LONG",
                     reason=(
                         f"Momentum alcista ({trigger}) | "
-                        f"Vol {vol_ratio:.2f}x sobre la media "
+                        f"Vol {vol_ratio:.2f}x (umbral {vol_threshold:.1f}x) "
                         f"(Vol={vol_curr:.0f}, SMA={vol_sma:.0f})"
                     ),
                     confidence=min(1.0, vol_ratio / 2),
@@ -519,15 +522,15 @@ class StrategyEngine:
                     name=name, signal="SHORT",
                     reason=(
                         f"Momentum bajista ({trigger}) | "
-                        f"Vol {vol_ratio:.2f}x sobre la media "
+                        f"Vol {vol_ratio:.2f}x (umbral {vol_threshold:.1f}x) "
                         f"(Vol={vol_curr:.0f}, SMA={vol_sma:.0f})"
                     ),
                     confidence=min(1.0, vol_ratio / 2),
                 )
 
-            # Sin señal
+            # Sin senal
             momentum_str = "ALCISTA" if hist_curr > 0 else "BAJISTA"
-            vol_str      = f"ALTO ✓ ({vol_ratio:.2f}x)" if high_volume else f"BAJO ({vol_ratio:.2f}x)"
+            vol_str      = f"OK ({vol_ratio:.2f}x >= {vol_threshold:.1f}x)" if high_volume else f"INSUF ({vol_ratio:.2f}x < {vol_threshold:.1f}x)"
             return SignalResult(
                 name=name, signal="HOLD",
                 reason=f"Sin cruce MACD. Momentum: {momentum_str} | Volumen: {vol_str}",
