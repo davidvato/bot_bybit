@@ -125,7 +125,7 @@ class BotConfig:
     # Con 4 estrategias activas, se recomienda 3 para produccion.
     # Para TESTING: usar 2 para generar mas senales y validar la mecanica del bot.
     # Para PRODUCCION: volver a 3.
-    min_consensus: int = 2
+    min_consensus: int = 3
 
     # -------------------------------------------------------------------------
     # FILTRO ADX
